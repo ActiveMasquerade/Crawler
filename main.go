@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -25,9 +26,8 @@ type Queue struct {
 type CrawlSet struct {
 	crawl map[string]bool
 	mu    sync.Mutex
-	size  int
+	size int
 }
-
 
 type db struct {
 	content []webpage
@@ -39,6 +39,7 @@ type webpage struct {
 	Content string
 	Url     string
 }
+
 func (q *Queue) Dequeue() (string, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -51,13 +52,22 @@ func (q *Queue) Dequeue() (string, error) {
 	return url, nil
 }
 
-func (q *Queue) Enqueue(url string) error {
+func (q *Queue) Enqueue(url string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.size++
 	q.members = append(q.members, url)
-	return nil
 }
+
+func (c *CrawlSet) CrawlAdd(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.crawl[key] {
+		c.crawl[key] = true
+		c.size++
+	}
+}
+
 func saveToJSON(db *db, filename string) error {
 	file, err := os.Create(filename)
 	if err != nil {
@@ -66,18 +76,8 @@ func saveToJSON(db *db, filename string) error {
 	defer file.Close()
 
 	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ") 
+	encoder.SetIndent("", "  ")
 	return encoder.Encode(db.content)
-}
-
-
-func(crawl *CrawlSet) CrawlAdd( key string) {
-	crawl.mu.Lock()
-	defer crawl.mu.Unlock()
-	if !crawl.crawl[key] {
-		crawl.crawl[key] = true
-		crawl.size++
-	}
 }
 
 func fetch(url string, c chan []byte) {
@@ -95,90 +95,111 @@ func fetch(url string, c chan []byte) {
 	}
 	c <- body
 }
-func parse(q *Queue, content []byte, db *db, currUrl string, c *CrawlSet) {
+
+func parse(q *Queue, content []byte, db *db, currUrl string, c *CrawlSet, rootHost string) {
 	z := html.NewTokenizer(bytes.NewReader(content))
-	body := false
+	inBody := false
 	tokenCount := 0
-	pageContentLength := 0
-	webpage := webpage{Url: currUrl, Title: "", Content: ""}
-	
+	contentLength := 0
+	page := webpage{Url: currUrl}
+
 	for {
 		tt := z.Next()
 		if tt == html.ErrorToken || tokenCount > 500 {
-			db.content = append(db.content, webpage)
+			db.content = append(db.content, page)
 			break
 		}
-		token := z.Token()
-		if token.Type == html.StartTagToken {
-			if token.Data == "javascript" {
+
+		tok := z.Token()
+		if tok.Type == html.StartTagToken {
+			switch tok.Data {
+			case "title":
 				z.Next()
-				continue
-			}
-			if token.Data == "body" {
-				body = true
-			}
-			if token.Data == "title" {
-				z.Next()
-				webpage.Title = z.Token().Data
-			}
-			if token.Data == "a" {
-				for _, v := range token.Attr {
-					if v.Key == "href" {
-						c.mu.Lock()
-						_, ok := c.crawl[v.Val]
-						c.mu.Unlock()
-						if !ok {
-							q.Enqueue(v.Val)
-							c.CrawlAdd( v.Val)
+				page.Title = z.Token().Data
+			case "body":
+				inBody = true
+			case "a":
+				for _, attr := range tok.Attr {
+					if attr.Key == "href" {
+						link, err := url.Parse(attr.Val)
+						if err != nil {
+							continue
+						}
+						if link.Host == "" || link.Host == rootHost {
+							absUrl := link.String()
+							c.mu.Lock()
+							_, seen := c.crawl[absUrl]
+							c.mu.Unlock()
+							if !seen {
+								q.Enqueue(absUrl)
+								c.CrawlAdd(absUrl)
+							}
 						}
 					}
 				}
 			}
 		}
-		if token.Type == html.TextToken && body && pageContentLength < 500 {
-			webpage.Content += token.Data
-			pageContentLength += len(token.Data)
+
+		if tok.Type == html.TextToken && inBody && contentLength < 500 {
+			page.Content += tok.Data
+			contentLength += len(tok.Data)
 		}
+
 		tokenCount++
 	}
 }
 
 func main() {
-	root := flag.String("root","https://web-scraping.dev/", "Starting Url")
+	root := flag.String("root", "https://web-scraping.dev/", "Starting URL")
+	limit := flag.Int("limit", 50, "Number of pages to crawl")
+	output := flag.String("output", "results.json", "Output file name")
+	verbose := flag.Bool("v", false, "Enable verbose logging")
+	flag.Parse()
+
+	parsedRoot, err := url.Parse(*root)
+	if err != nil {
+		fmt.Println("Invalid root URL")
+		return
+	}
+
 	c := make(chan []byte, 10)
-	limit := flag.Int("limit" , 50, "Number of pages to be crawled")
-	output := flag.String("output", "results.json","output file name")
-	q := Queue{size: 0, members: []string{},crawled: 0}
+	q := Queue{}
 	crawler := CrawlSet{crawl: make(map[string]bool)}
 	database := db{}
-	flag.Parse()
+
 	t0 := time.Now()
 	q.Enqueue(*root)
 	crawler.CrawlAdd(*root)
 
 	for q.size > 0 && q.crawled < *limit {
-		url, err := q.Dequeue()
+		currUrl, err := q.Dequeue()
 		if err != nil {
 			break
 		}
-		go fetch(url, c)
+
+		if *verbose {
+			fmt.Println("Crawling:", currUrl)
+		}
+
+		go fetch(currUrl, c)
 		data := <-c
 		if len(data) == 0 {
 			continue
 		}
-		parse(&q, data, &database, url, &crawler)
-		
+
+		parse(&q, data, &database, currUrl, &crawler, parsedRoot.Host)
 		q.crawled++
 	}
-	err := saveToJSON(&database, *output)
+
+	err = saveToJSON(&database, *output)
 	if err != nil {
 		fmt.Println("Failed to save JSON:", err)
 	} else {
-		fmt.Println("Saved crawl results to",*output)
+		fmt.Println("Saved crawl results to", *output)
 	}
-	fmt.Println("Time taken to crawl:" ,time.Since(t0).Seconds())
+
+	fmt.Println("Time taken to crawl:", time.Since(t0).Seconds(), "seconds")
 	fmt.Printf("Total pages crawled: %d\n", len(database.content))
 	fmt.Printf("Total unique URLs seen: %d\n", crawler.size)
 	fmt.Printf("Remaining in queue: %d\n", q.size)
-	
 }
